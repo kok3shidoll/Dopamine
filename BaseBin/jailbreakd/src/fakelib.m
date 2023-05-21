@@ -6,6 +6,9 @@
 #import "trustcache.h"
 #import <sys/param.h>
 #import <sys/mount.h>
+#import <copyfile.h>
+
+extern void setJetsamEnabled(bool enabled);
 
 void generateSystemWideSandboxExtensions(NSString *targetPath)
 {
@@ -89,25 +92,35 @@ int carbonCopySingle(NSString *sourcePath, NSString *targetPath)
 
 int carbonCopy(NSString *sourcePath, NSString *targetPath)
 {
+	setJetsamEnabled(NO);
+	int retval = 0;
 	BOOL isDirectory = NO;
 	BOOL exists = fileExistsOrSymlink(sourcePath, &isDirectory);
-	if (!exists) return 1;
-
-	if (isDirectory) {
-		int r = carbonCopySingle(sourcePath, targetPath);
-		if (r != 0) return r;
-		NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:sourcePath];
-		for (NSString *relativePath in enumerator) {
-			NSString *subSourcePath = [sourcePath stringByAppendingPathComponent:relativePath];
-			NSString *subTargetPath = [targetPath stringByAppendingPathComponent:relativePath];
-			r = carbonCopySingle(subSourcePath, subTargetPath);
-			if (r != 0) return r;
+	if (exists) {
+		if (isDirectory) {
+			retval = carbonCopySingle(sourcePath, targetPath);
+			if (retval == 0) {
+				NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:sourcePath];
+				for (NSString *relativePath in enumerator) {
+					@autoreleasepool {
+						NSString *subSourcePath = [sourcePath stringByAppendingPathComponent:relativePath];
+						NSString *subTargetPath = [targetPath stringByAppendingPathComponent:relativePath];
+						retval = carbonCopySingle(subSourcePath, subTargetPath);
+						if (retval != 0) break;
+					}
+				}
+			}
+			
 		}
-		return 0;
+		else {
+			retval = carbonCopySingle(sourcePath, targetPath);
+		}
 	}
 	else {
-		return carbonCopySingle(sourcePath, targetPath);
+		retval = 1;
 	}
+	setJetsamEnabled(YES);
+	return retval;
 }
 
 int setFakeLibVisible(bool visible)
