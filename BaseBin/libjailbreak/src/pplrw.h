@@ -6,11 +6,18 @@ typedef enum {
 } PPLRWStatus;
 extern PPLRWStatus gPPLRWStatus;
 
-void *mapInRange(uint64_t pageStart, uint32_t pageCount, uint8_t** mappingStart);
+// This can be called manually to batch together multiple PPLRW operations for maximum performance
+void gPPLRWQueue_dispatch(void (^block)(void));
+
+uint64_t va_to_pa(uint64_t table, uint64_t virt, bool *err);
+uint64_t kaddr_to_pa(uint64_t virt, bool *err);
+void *mapInVirtual(uint64_t pageStart, uint32_t pageCount, uint8_t** mappingStart);
 void mappingDestroy(void* ctx);
 
 int physreadbuf(uint64_t physaddr, void* output, size_t size);
 int physwritebuf(uint64_t physaddr, const void* input, size_t size);
+int kreadbuf(uint64_t kaddr, void* output, size_t size);
+int kwritebuf(uint64_t kaddr, const void* input, size_t size);
 
 uint64_t physread64(uint64_t pa);
 uint64_t physread_ptr(uint64_t va);
@@ -22,9 +29,6 @@ int physwrite64(uint64_t pa, uint64_t v);
 int physwrite32(uint64_t pa, uint32_t v);
 int physwrite16(uint64_t pa, uint16_t v);
 int physwrite8(uint64_t pa, uint8_t v);
-
-int kreadbuf(uint64_t kaddr, void* output, size_t size);
-int kwritebuf(uint64_t kaddr, const void* input, size_t size);
 
 uint64_t kread64(uint64_t va);
 uint64_t kread_ptr(uint64_t va);

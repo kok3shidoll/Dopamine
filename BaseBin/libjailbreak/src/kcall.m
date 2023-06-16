@@ -46,6 +46,7 @@ KcallStatus gKCallStatus = kKcallStatusNotInitialized;
 
 uint64_t gUserReturnThreadContext = 0;
 volatile uint64_t gUserReturnDidHappen = 0;
+static NSLock *gKcallLock;
 
 uint64_t getUserReturnThreadContext(void) {
 	if (gUserReturnThreadContext != 0) {
@@ -112,6 +113,8 @@ void Fugu14Kcall_prepareThreadState(Fugu14KcallThread *callThread, KcallThreadSt
 
 uint64_t Fugu14Kcall_withThreadState(Fugu14KcallThread *callThread, KcallThreadState *threadState)
 {
+	[gKcallLock lock];
+
 	// Restore signed state first
 	kwritebuf(callThread->actContext, &callThread->signedState, sizeof(kRegisterState));
 	
@@ -143,18 +146,24 @@ uint64_t Fugu14Kcall_withThreadState(Fugu14KcallThread *callThread, KcallThreadS
 	// Sync all changes
 	// (Probably not required)
 	MEMORY_BARRIER
-	
+
 	// Copy return value
-	return callThread->scratchMemoryMapped[0];
+	uint64_t retval = callThread->scratchMemoryMapped[0];
+
+	[gKcallLock unlock];
+	
+	return retval;
 }
 
-uint64_t Fugu14Kcall_withArguments(Fugu14KcallThread *callThread, uint64_t func, uint64_t argc, uint64_t *argv)
+uint64_t Fugu14Kcall_withArguments(Fugu14KcallThread *callThread, uint64_t func, uint64_t argc, const uint64_t *argv)
 {
 	if (argc >= 19) argc = 19;
 
 	KcallThreadState threadState = { 0 };
 	Fugu14Kcall_prepareThreadState(&gFugu14KcallThread, &threadState);
 	threadState.pc = func;
+
+	[gKcallLock lock];
 
 	uint64_t regArgc = 0;
 	uint64_t stackArgc = 0;
@@ -179,10 +188,12 @@ uint64_t Fugu14Kcall_withArguments(Fugu14KcallThread *callThread, uint64_t func,
 		kwrite64(argKaddr, argv[8+i]);
 	}
 
+	[gKcallLock unlock];
+
 	return Fugu14Kcall_withThreadState(callThread, &threadState);
 }
 
-uint64_t kcall(uint64_t func, uint64_t argc, uint64_t *argv)
+uint64_t kcall(uint64_t func, uint64_t argc, const uint64_t *argv)
 {
 	if (gKCallStatus != kKcallStatusFinalized) {
 		if (gIsJailbreakd) return 0;
@@ -223,6 +234,8 @@ uint64_t initPACPrimitives(uint64_t kernelAllocation)
 		return 0;
 	}
 
+	gKcallLock = [[NSLock alloc] init];
+
 	thread_t thread = 0;
 	kern_return_t kr = thread_create(mach_task_self_, &thread);
 	if (kr != KERN_SUCCESS) {
@@ -245,7 +258,7 @@ uint64_t initPACPrimitives(uint64_t kernelAllocation)
 	}
 
 	// Map in previously allocated memory for stack (4 Pages)
-	gThreadMapContext = mapInRange(kernelAllocation, 4, &gThreadMapStart);
+	gThreadMapContext = mapInVirtual(kernelAllocation, 4, &gThreadMapStart);
 	if (!gThreadMapContext)
 	{
 		JBLogError("ERROR: gThreadMapContext lookup failure");
@@ -467,9 +480,4 @@ int recoverPACPrimitives()
 	// If everything went well, finalize and return success
 	finalizePACPrimitives();
 	return 0;
-}
-
-void destroyPACPrimitives(void)
-{
-	// TODO
 }

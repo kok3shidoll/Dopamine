@@ -1,6 +1,7 @@
 #import "util.h"
 #import "pplrw.h"
 #import "kcall.h"
+#import "csblob.h"
 #import "boot_info.h"
 #import "signatures.h"
 #import "log.h"
@@ -56,24 +57,32 @@ NSString *prebootPath(NSString *path)
 	}
 }
 
-uint64_t kalloc(uint64_t size)
+int kalloc(uint64_t *addr, uint64_t size)
 {
 	uint64_t kalloc_data_external = bootInfo_getSlidUInt64(@"kalloc_data_external");
-	return kcall(kalloc_data_external, 2, (uint64_t[]){size, 1});
+	uint64_t allocation = kcall(kalloc_data_external, 2, (uint64_t[]){size, 1});
+	if (allocation != 0) {
+		if (addr) *addr = allocation;
+		return 0;
+	}
+	return 1;
 }
 
-uint64_t kfree(uint64_t addr, uint64_t size)
+int kfree(uint64_t addr, uint64_t size)
 {
 	uint64_t kfree_data_external = bootInfo_getSlidUInt64(@"kfree_data_external");
-	return kcall(kfree_data_external, 3, (uint64_t[]){addr, size});
+	return (int)kcall(kfree_data_external, 3, (uint64_t[]){addr, size});
 }
 
 uint64_t stringKalloc(const char *string)
 {
 	uint64_t stringLen = strlen(string) + 1;
-	uint64_t stringInKmem = kalloc(stringLen);
-	kwritebuf(stringInKmem, string, stringLen);
-	return stringInKmem;
+	uint64_t stringInKmem = 0;
+	if (kalloc(&stringInKmem, stringLen) == 0) {
+		kwritebuf(stringInKmem, string, stringLen);
+		return stringInKmem;
+	}
+	return 0;
 }
 
 void stringKFree(const char *string, uint64_t kmem)
@@ -106,7 +115,8 @@ uint64_t kpacda(uint64_t pointer, uint64_t modifier)
 	|----------------------|
 	*/
 
-	uint64_t outputAllocation = kalloc(0x8);
+	uint64_t outputAllocation = 0;
+	if (kalloc(&outputAllocation, 0x8) != 0) return 0;
 	KcallThreadState threadState = { 0 };
 	threadState.pc = pacda_gadget;
 	threadState.x[1] = pointer;
@@ -133,6 +143,11 @@ void kwrite_ptr(uint64_t kaddr, uint64_t pointer, uint16_t salt)
 uint64_t proc_get_task(uint64_t proc_ptr)
 {
 	return kread_ptr(proc_ptr + 0x10);
+}
+
+uint64_t proc_get_pptr(uint64_t proc_ptr)
+{
+	return kread_ptr(proc_ptr + 0x18);
 }
 
 pid_t proc_get_pid(uint64_t proc_ptr)
@@ -250,15 +265,14 @@ uint64_t proc_get_vnode_by_file_descriptor(uint64_t proc_ptr, int fd)
 	return kread_ptr(file_glob_ptr + 0x38);
 }
 
-/*uint32_t proc_get_csflags(uint64_t proc)
+uint32_t proc_get_csflags(uint64_t proc)
 {
 	if (@available(iOS 15.2, *)) {
 		uint64_t proc_ro = proc_get_proc_ro(proc);
 		return kread32(proc_ro + 0x1C);
 	}
 	else {
-		// TODO
-		return 0;
+		return kread32(proc + 0x300);
 	}
 }
 
@@ -269,9 +283,9 @@ void proc_set_csflags(uint64_t proc, uint32_t csflags)
 		kwrite32(proc_ro + 0x1C, csflags);
 	}
 	else {
-		// TODO
+		kwrite32(proc + 0x300, csflags);
 	}
-}*/
+}
 
 uint32_t proc_get_svuid(uint64_t proc_ptr)
 {
@@ -417,6 +431,18 @@ uint64_t task_get_vm_map(uint64_t task_ptr)
 	return kread_ptr(task_ptr + 0x28);
 }
 
+void task_set_memory_ownership_transfer(uint64_t task_ptr, uint8_t enabled)
+{
+	uint32_t offset = 0x0;
+	if (@available(iOS 15.2, *)) {
+		offset = 0x580;
+	}
+	else {
+		offset = 0x5C0;
+	}
+	kwrite8(task_ptr + offset, enabled);
+}
+
 uint64_t self_task(void)
 {
 	static uint64_t gSelfTask = 0;
@@ -432,47 +458,89 @@ uint64_t vm_map_get_pmap(uint64_t vm_map_ptr)
 	return kread_ptr(vm_map_ptr + bootInfo_getUInt64(@"VM_MAP_PMAP"));
 }
 
-void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start, uint64_t end, uint64_t entry, BOOL* stop))
+uint64_t vm_map_get_header(uint64_t vm_map_ptr)
 {
-	uint64_t header = vm_map_ptr + 0x10;
-	uint64_t link = header + 0x0;
-	uint64_t entry = kread_ptr(link + 0x8);
-	int numentry = kread32(header + 0x20);
+	return vm_map_ptr + 0x10;
+}
 
-	while(entry != 0 && numentry > 0)
-	{
-		link = entry + 0x0;
-		uint64_t start = kread64(link + 0x10);
-		uint64_t end = kread64(link + 0x18);
+uint64_t vm_map_header_get_first_entry(uint64_t vm_header_ptr)
+{
+	return kread_ptr(vm_header_ptr + 0x8);
+}
+
+uint64_t vm_map_entry_get_next_entry(uint64_t vm_entry_ptr)
+{
+	return kread_ptr(vm_entry_ptr + 0x8);
+}
+
+uint32_t vm_header_get_nentries(uint64_t vm_header_ptr)
+{
+	return kread32(vm_header_ptr + 0x20);
+}
+
+void vm_entry_get_range(uint64_t vm_entry_ptr, uint64_t *start_address_out, uint64_t *end_address_out)
+{
+	uint64_t range[2];
+	kreadbuf(vm_entry_ptr + 0x10, &range[0], sizeof(range));
+	if (start_address_out) *start_address_out = range[0];
+	if (end_address_out) *end_address_out = range[1];
+}
+
+void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop))
+{
+	uint64_t header = vm_map_get_header(vm_map_ptr);
+	uint64_t entry = vm_map_header_get_first_entry(header);
+	uint64_t numEntries = vm_header_get_nentries(header);
+
+	while (entry != 0 && numEntries > 0) {
+		uint64_t start = 0, end = 0;
+		vm_entry_get_range(entry, &start, &end);
 
 		BOOL stop = NO;
 		itBlock(start, end, entry, &stop);
-		if(stop) break;
+		if (stop) break;
 
-		entry = kread_ptr(link + 0x8);
-		numentry--;
+		entry = vm_map_entry_get_next_entry(entry);
+		numEntries--;
 	}
 }
 
-uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t map_start)
+uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
 {
-	uint64_t header = vm_map_ptr + 0x10;
-	uint64_t link = header + 0x0;
-	uint64_t entry = kread_ptr(link + 0x8);
-	int numentry = kread32(header + 0x20);
+	__block uint64_t found_entry = 0;
+	vm_map_iterate_entries(vm_map_ptr, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+		if (address >= start && address < end) {
+			found_entry = entry;
+			*stop = YES;
+		}
+	});
+	return found_entry;
+}
 
-	while(entry != 0 && numentry > 0)
-	{
-		link = entry + 0x0;
-		uint64_t start = kread64(link + 0x10);
-
-		if (start == map_start) return entry;
-
-		entry = kread_ptr(link + 0x8);
-		numentry--;
+vm_map_flags vm_map_get_flags(uint64_t vm_map_ptr)
+{
+	uint32_t flags_offset = 0;
+	if (@available(iOS 15.2, *)) {
+		flags_offset = 0x11C;
 	}
+	else {
+		flags_offset = 0x94;
+	}
+	vm_map_flags flags;
+	kreadbuf(vm_map_ptr + flags_offset, &flags, sizeof(flags));
+	return flags;
+}
 
-	return 0;
+void vm_map_set_flags(uint64_t vm_map_ptr, vm_map_flags new_flags)
+{
+	uint32_t flags_offset = 0;
+	if (@available(iOS 15.2, *)) {
+		flags_offset = 0x11C;
+	}
+	else {
+		flags_offset = 0x94;
+	}
+	kwritebuf(vm_map_ptr + flags_offset, &new_flags, sizeof(new_flags));
 }
 
 #define FLAGS_PROT_SHIFT    7
@@ -839,39 +907,47 @@ void proc_replace_entitlements(uint64_t proc_ptr, NSDictionary *newEntitlements)
 	//cr_label_replace_entitlements(cr_label_ptr, newEntitlements, vnode_get_csblob(text_vnode));
 }*/
 
-int proc_set_debugged(pid_t pid)
+int proc_set_debugged(uint64_t proc_ptr, bool fully_debugged)
 {
+	uint64_t task = proc_get_task(proc_ptr);
+	uint64_t vm_map = task_get_vm_map(task);
+	uint64_t pmap = vm_map_get_pmap(vm_map);
+
+	// For most unrestrictions, just setting wx_allowed is enough
+	// This enabled hooks without being detectable at all, as cs_ops will not return CS_DEBUGGED
+	pmap_set_wx_allowed(pmap, true);
+
+	if (fully_debugged) {
+		// When coming from ptrace, we want to fully emulate cs_allow_invalid though
+
+		uint32_t flags = proc_get_csflags(proc_ptr) & ~(CS_KILL | CS_HARD);
+		if (flags & CS_VALID) {
+			flags |= CS_DEBUGGED;
+		}
+		proc_set_csflags(proc_ptr, flags);
+
+		task_set_memory_ownership_transfer(task, true);
+
+		vm_map_flags map_flags = vm_map_get_flags(vm_map);
+		map_flags.switch_protect = false;
+		map_flags.cs_debugged = true;
+		vm_map_set_flags(vm_map, map_flags);
+	}
+	return 0;
+}
+
+int proc_set_debugged_pid(pid_t pid, bool fully_debugged)
+{
+	int retval = -1;
 	if (pid > 0) {
 		bool proc_needs_release = false;
 		uint64_t proc = proc_for_pid(pid, &proc_needs_release);
 		if (proc != 0) {
-			uint64_t task = proc_get_task(proc);
-			uint64_t vm_map = task_get_vm_map(task);
-			uint64_t pmap = vm_map_get_pmap(vm_map);
-
-			pmap_set_wx_allowed(pmap, true);
-
-			// --- cs_flags, not needed, wx_allowed is enough
-			// uint32_t csflags = proc_get_csflags(proc);
-			// uint32_t new_csflags = ((csflags & ~0x703b10) | 0x10000024);
-			// proc_set_csflags(proc, new_csflags);
-
-			// --- some vm map crap, not needed
-			// uint32_t f1 = kread32(vm_map + 0x94);
-			// uint32_t f2 = kread32(vm_map + 0x98);
-			// printf("before f1: %X, f2: %X\n", f1, f2);
-			// f1 &= ~0x10u;
-			// f2++;
-			// f1 |= 0x8000;
-			// f2++;
-			// printf("after f1: %X, f2: %X\n", f1, f2);
-			// kwrite32(vm_map + 0x94, f1);
-			// kwrite32(vm_map + 0x98, f2);
-
+			retval = proc_set_debugged(proc, fully_debugged);
 			if (proc_needs_release) proc_rele(proc);
 		}
 	}
-	return 0;
+	return retval;
 }
 
 NSString *proc_get_path(pid_t pid)
